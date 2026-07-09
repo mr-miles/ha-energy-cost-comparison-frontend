@@ -389,13 +389,9 @@
           this._costSeries = this._extractCostSeries(data.prefs);
         }
 
-        // Use the stats the collection already fetched (avoids duplicate requests)
-        if (data.stats) {
-          this._stats = data.stats;
-          this._loading = false;
-          this._error = null;
-          this._render();
-        }
+        // Trigger our own fetch — the collection's raw stats are energy (kWh),
+        // not cost; we need to apply pricing logic ourselves.
+        this._loadAndRender();
       });
     }
 
@@ -456,46 +452,58 @@
       for (const source of prefs.energy_sources) {
         if (source.type !== 'grid') continue;
         for (const flow of source.flow_from || []) {
-          if (!flow.stat_cost) continue;
-          // Attempt a friendly label from the entity name
-          const entityId = flow.entity_energy_from;
-          const friendlyName = entityId && this._hass?.states?.[entityId]
-            ?.attributes?.friendly_name;
-          series.push({
-            id: flow.stat_cost,
-            label: friendlyName || (series.length === 0 ? 'Electricity' : `Tariff ${series.length + 1}`),
-            color: SERIES_COLORS[colorIdx++ % SERIES_COLORS.length],
-          });
+          const entityId = flow.stat_energy_from;
+          const friendlyName = entityId && this._hass?.states?.[entityId]?.attributes?.friendly_name;
+          const label = friendlyName || (series.length === 0 ? 'Electricity' : `Tariff ${series.length + 1}`);
+          const color = SERIES_COLORS[colorIdx++ % SERIES_COLORS.length];
+
+          if (flow.stat_cost) {
+            // Pre-recorded cost statistic
+            series.push({ key: flow.stat_cost, mode: 'stat', statId: flow.stat_cost, label, color });
+          } else if (flow.stat_energy_from && flow.number_energy_price != null) {
+            // Fixed unit rate: cost = energy_kWh × price
+            series.push({ key: flow.stat_energy_from, mode: 'fixed', energyStatId: flow.stat_energy_from, price: flow.number_energy_price, label, color });
+          } else if (flow.stat_energy_from && flow.entity_energy_price) {
+            // Dynamic rate (e.g. Octopus): cost = energy_kWh × mean_rate_per_period
+            series.push({ key: flow.stat_energy_from, mode: 'dynamic', energyStatId: flow.stat_energy_from, priceStatId: flow.entity_energy_price, label, color });
+          }
         }
       }
       return series;
     }
 
     async _fetchStats() {
-      if (!this._prefs || this._costSeries.length === 0) {
-        console.debug('[energy-cost-graph-card] skipping fetch — no prefs or cost series');
-        return;
-      }
+      if (!this._prefs || this._costSeries.length === 0) return;
 
-      const statIds = this._costSeries.map(s => s.id);
-      console.debug('[energy-cost-graph-card] fetching stats', {
-        statIds, start: this._start, end: this._end, period: this._chartPeriod,
-      });
+      const base = {
+        type:       'recorder/statistics_during_period',
+        start_time: this._start.toISOString(),
+        end_time:   this._end.toISOString(),
+        period:     this._chartPeriod,
+      };
+
+      const statSeries    = this._costSeries.filter(s => s.mode === 'stat');
+      const energySeries  = this._costSeries.filter(s => s.mode !== 'stat');
+      const dynamicSeries = this._costSeries.filter(s => s.mode === 'dynamic');
+
       try {
-        // recorder/statistics_during_period (added HA 2021.12, types param ≥ 2022.12)
-        this._stats = await this._hass.callWS({
-          type: 'recorder/statistics_during_period',
-          start_time: this._start.toISOString(),
-          end_time:   this._end.toISOString(),
-          statistic_ids: statIds,
-          period: this._chartPeriod,
-          types: ['change', 'sum'],
-          units: {},
-        });
-        console.debug('[energy-cost-graph-card] stats response', this._stats);
+        const [costData, energyData, priceData] = await Promise.all([
+          statSeries.length
+            ? this._hass.callWS({ ...base, statistic_ids: statSeries.map(s => s.statId), types: ['change', 'sum'], units: {} })
+            : {},
+          energySeries.length
+            ? this._hass.callWS({ ...base, statistic_ids: [...new Set(energySeries.map(s => s.energyStatId))], types: ['change', 'sum'], units: { energy: 'kWh' } })
+            : {},
+          dynamicSeries.length
+            ? this._hass.callWS({ ...base, statistic_ids: [...new Set(dynamicSeries.map(s => s.priceStatId))], types: ['mean'], units: {} })
+            : {},
+        ]);
+        this._costData   = costData;
+        this._energyData = energyData;
+        this._priceData  = priceData;
       } catch (err) {
         console.error('[energy-cost-graph-card] stats fetch failed', err);
-        this._stats = {};
+        this._costData = this._energyData = this._priceData = {};
         throw err;
       }
     }
@@ -505,34 +513,14 @@
     // -------------------------------------------------------------------------
 
     _buildChartData() {
-      if (!this._costSeries.length || !this._stats) return [];
+      if (!this._costSeries.length) return [];
 
-      // Collect all timestamps that appear in any series
-      const slotMap = new Map(); // ts(ms) → {ts, values:{seriesId→value}}
+      const slotMap = new Map();
 
       for (const series of this._costSeries) {
-        const rows = this._stats[series.id];
-        if (!rows?.length) continue;
-
-        // HA may return 'change' directly; fall back to computing delta from 'sum'.
-        let prevSum = null;
-
-        for (const row of rows) {
-          // Timestamps may be ms or seconds – normalise
-          const ts = row.start > 1e12 ? row.start : row.start * 1000;
-
-          let value = row.change;
-          if (value == null) {
-            // Older HA or types not supported: derive from consecutive sums
-            value = (row.sum != null && prevSum != null) ? row.sum - prevSum : 0;
-          }
-          prevSum = row.sum ?? prevSum;
-
-          // Cost deltas should never be negative in a bar chart
-          value = Math.max(0, value || 0);
-
+        for (const { ts, value } of this._computeCostValues(series)) {
           if (!slotMap.has(ts)) slotMap.set(ts, { ts, values: {} });
-          slotMap.get(ts).values[series.id] = value;
+          slotMap.get(ts).values[series.key] = Math.max(0, value || 0);
         }
       }
 
@@ -541,8 +529,38 @@
         .map(slot => ({
           ...slot,
           label: this._timeLabel(new Date(slot.ts)),
-          total: this._costSeries.reduce((s, sr) => s + (slot.values[sr.id] || 0), 0),
+          total: this._costSeries.reduce((s, sr) => s + (slot.values[sr.key] || 0), 0),
         }));
+    }
+
+    _computeCostValues(series) {
+      if (series.mode === 'stat') {
+        return this._deltaRows(this._costData?.[series.statId] || []);
+      }
+      const energyDeltas = this._deltaRows(this._energyData?.[series.energyStatId] || []);
+      if (series.mode === 'fixed') {
+        return energyDeltas.map(({ ts, value }) => ({ ts, value: value * series.price }));
+      }
+      // dynamic: energy × mean rate recorded per period
+      const priceLookup = new Map(
+        (this._priceData?.[series.priceStatId] || []).map(r => {
+          const ts = r.start > 1e12 ? r.start : r.start * 1000;
+          return [ts, r.mean ?? 0];
+        })
+      );
+      return energyDeltas.map(({ ts, value }) => ({ ts, value: value * (priceLookup.get(ts) ?? 0) }));
+    }
+
+    _deltaRows(rows) {
+      const result = [];
+      let prevSum = null;
+      for (const row of rows) {
+        const ts = row.start > 1e12 ? row.start : row.start * 1000;
+        const value = row.change ?? ((row.sum != null && prevSum != null) ? row.sum - prevSum : 0);
+        prevSum = row.sum ?? prevSum;
+        result.push({ ts, value });
+      }
+      return result;
     }
 
     _timeLabel(date) {
@@ -768,7 +786,7 @@
         const x0 = i * slotW + barPad;
         let stackTop = ch; // pixels from top within chart area, starts at bottom
         const rects = this._costSeries.map(series => {
-          const v = slot.values[series.id] || 0;
+          const v = slot.values[series.key] || 0;
           if (v <= 0) return '';
           const bh = (v / yMax) * ch;
           stackTop -= bh;
@@ -1039,17 +1057,24 @@
     .state-box.is-error { color: var(--error-color, #F44336); }
   `;
 
-  // ── Utility: find cost stat IDs in energy prefs ──────────────────────────
-  function extractCostStatIds(prefs) {
-    const ids = [];
-    if (!prefs?.energy_sources) return ids;
+  // ── Utility: extract cost sources from energy prefs ──────────────────────
+  // Returns [{mode, statId?}, {mode, energyStatId, price?}, {mode, energyStatId, priceStatId}]
+  function extractCostSources(prefs) {
+    const sources = [];
+    if (!prefs?.energy_sources) return sources;
     for (const source of prefs.energy_sources) {
       if (source.type !== 'grid') continue;
       for (const flow of source.flow_from || []) {
-        if (flow.stat_cost) ids.push(flow.stat_cost);
+        if (flow.stat_cost) {
+          sources.push({ mode: 'stat', statId: flow.stat_cost });
+        } else if (flow.stat_energy_from && flow.number_energy_price != null) {
+          sources.push({ mode: 'fixed', energyStatId: flow.stat_energy_from, price: flow.number_energy_price });
+        } else if (flow.stat_energy_from && flow.entity_energy_price) {
+          sources.push({ mode: 'dynamic', energyStatId: flow.stat_energy_from, priceStatId: flow.entity_energy_price });
+        }
       }
     }
-    return ids;
+    return sources;
   }
 
   // ── Utility: nice round number for y-axis ceiling ─────────────────────────
@@ -1070,7 +1095,7 @@
       this._hass        = null;
       this._config      = {};
       this._prefs       = null;
-      this._costStatIds = [];
+      this._costSources = [];
 
       // Processed data
       this._todayCum    = [];   // cumulative £ per hour index, index = hour 0..currentHour
@@ -1113,7 +1138,7 @@
 
       try {
         await this._loadPrefs();
-        if (this._costStatIds.length > 0) await this._fetchAndProcess();
+        if (this._costSources.length > 0) await this._fetchAndProcess();
       } catch (err) {
         this._error = err.message || String(err);
         console.error('[energy-cost-compare-card]', err);
@@ -1128,7 +1153,7 @@
       this._render();
       try {
         if (!this._prefs) await this._loadPrefs();
-        if (this._costStatIds.length > 0) await this._fetchAndProcess();
+        if (this._costSources.length > 0) await this._fetchAndProcess();
       } catch (err) {
         this._error = err.message || String(err);
       }
@@ -1139,10 +1164,10 @@
     async _loadPrefs() {
       try {
         this._prefs = await this._hass.callWS({ type: 'energy/get_prefs' });
-        this._costStatIds = extractCostStatIds(this._prefs);
+        this._costSources = extractCostSources(this._prefs);
       } catch (_) {
         this._prefs = null;
-        this._costStatIds = [];
+        this._costSources = [];
       }
     }
 
@@ -1178,41 +1203,63 @@
 
       const weeks = Math.max(1, Math.min(12, +this._config.weeks || 5));
 
-      // ── Today's hourly stats and server-side average run in parallel ───
-      const [todayRaw, histResult] = await Promise.all([
-        this._hass.callWS({
-          type: 'recorder/statistics_during_period',
-          start_time: todayMid.toISOString(),
-          end_time:   new Date(now.getTime() + 60_000).toISOString(),
-          statistic_ids: this._costStatIds,
-          period: 'hour',
-          types: ['change', 'sum'],
-        }),
-        // Server reads cost stat IDs from energy prefs itself, does the
-        // 5-week fetch, weekday filter, cumulative average, and std-dev.
-        // Returns 48 numbers instead of ~840 raw rows.
-        this._hass.callWS({
-          type:  'energy_cost_compare/weekday_average',
-          weeks,
-          // weekday omitted — server defaults to today's weekday
-        }),
+      // ── Determine which stat IDs to fetch for today ───────────────────
+      const statSources    = this._costSources.filter(s => s.mode === 'stat');
+      const energySources  = this._costSources.filter(s => s.mode !== 'stat');
+      const dynamicSources = this._costSources.filter(s => s.mode === 'dynamic');
+
+      const todayBase = {
+        type: 'recorder/statistics_during_period',
+        start_time: todayMid.toISOString(),
+        end_time:   new Date(now.getTime() + 60_000).toISOString(),
+        period: 'hour',
+      };
+
+      // ── Today's stats, energy stats, price stats and server average in parallel
+      const [costRaw, energyRaw, priceRaw, histResult] = await Promise.all([
+        statSources.length
+          ? this._hass.callWS({ ...todayBase, statistic_ids: statSources.map(s => s.statId), types: ['change', 'sum'] })
+          : {},
+        energySources.length
+          ? this._hass.callWS({ ...todayBase, statistic_ids: [...new Set(energySources.map(s => s.energyStatId))], types: ['change', 'sum'], units: { energy: 'kWh' } })
+          : {},
+        dynamicSources.length
+          ? this._hass.callWS({ ...todayBase, statistic_ids: [...new Set(dynamicSources.map(s => s.priceStatId))], types: ['mean'], units: {} })
+          : {},
+        this._hass.callWS({ type: 'energy_cost_compare/weekday_average', weeks }),
       ]);
 
-      // ── Build today's hourly totals [hour 0..23] ──────────────────────
+      // ── Build today's hourly cost totals ──────────────────────────────
       const todayHourly = new Array(24).fill(0);
 
-      for (const statId of this._costStatIds) {
-        const rows = (todayRaw?.[statId] || []).sort((a, b) => a.start - b.start);
-        let prevSum = null;
+      const rowTs   = r => r.start > 1e12 ? r.start : r.start * 1000;
+      // Use offset from midnight so hour is in HA timezone, not browser local
+      const rowHour = r => Math.floor((rowTs(r) - todayMid.getTime()) / 3_600_000);
 
-        for (const row of rows) {
-          const ts   = row.start > 1e12 ? row.start : row.start * 1000;
-          const hour = new Date(ts).getHours();
-          if (hour < 0 || hour > 23) continue;
-
-          const cost = this._rowCost(row, prevSum);
-          prevSum    = row.sum ?? prevSum;
-          todayHourly[hour] += cost;
+      for (const src of this._costSources) {
+        if (src.mode === 'stat') {
+          const rows = (costRaw?.[src.statId] || []).sort((a, b) => a.start - b.start);
+          let prevSum = null;
+          for (const row of rows) {
+            const h = rowHour(row);
+            if (h >= 0 && h < 24) todayHourly[h] += this._rowCost(row, prevSum);
+            prevSum = row.sum ?? prevSum;
+          }
+        } else {
+          const rows = (energyRaw?.[src.energyStatId] || []).sort((a, b) => a.start - b.start);
+          // Build per-hour mean price lookup for dynamic mode
+          const priceLookup = src.mode === 'dynamic'
+            ? new Map((priceRaw?.[src.priceStatId] || []).map(r => [rowTs(r), r.mean ?? 0]))
+            : null;
+          let prevSum = null;
+          for (const row of rows) {
+            const h = rowHour(row);
+            const energyKwh = this._rowCost(row, prevSum);  // _rowCost gives delta kWh for energy rows too
+            prevSum = row.sum ?? prevSum;
+            if (h < 0 || h >= 24) continue;
+            const rate = src.mode === 'fixed' ? src.price : (priceLookup.get(rowTs(row)) ?? 0);
+            todayHourly[h] += energyKwh * rate;
+          }
         }
       }
 
@@ -1265,7 +1312,7 @@
           Go to Settings → Energy to add your energy sources.
         </div>`;
 
-      } else if (this._costStatIds.length === 0) {
+      } else if (this._costSources.length === 0) {
         body = `<div class="state-box">
           <b>No cost data found</b>
           Add a price to your grid sources in Settings → Energy.

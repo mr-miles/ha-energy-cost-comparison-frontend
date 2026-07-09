@@ -389,13 +389,9 @@
           this._costSeries = this._extractCostSeries(data.prefs);
         }
 
-        // Use the stats the collection already fetched (avoids duplicate requests)
-        if (data.stats) {
-          this._stats = data.stats;
-          this._loading = false;
-          this._error = null;
-          this._render();
-        }
+        // Trigger our own fetch — the collection's raw stats are energy (kWh),
+        // not cost; we need to apply pricing logic ourselves.
+        this._loadAndRender();
       });
     }
 
@@ -456,46 +452,58 @@
       for (const source of prefs.energy_sources) {
         if (source.type !== 'grid') continue;
         for (const flow of source.flow_from || []) {
-          if (!flow.stat_cost) continue;
-          // Attempt a friendly label from the entity name
-          const entityId = flow.entity_energy_from;
-          const friendlyName = entityId && this._hass?.states?.[entityId]
-            ?.attributes?.friendly_name;
-          series.push({
-            id: flow.stat_cost,
-            label: friendlyName || (series.length === 0 ? 'Electricity' : `Tariff ${series.length + 1}`),
-            color: SERIES_COLORS[colorIdx++ % SERIES_COLORS.length],
-          });
+          const entityId = flow.stat_energy_from;
+          const friendlyName = entityId && this._hass?.states?.[entityId]?.attributes?.friendly_name;
+          const label = friendlyName || (series.length === 0 ? 'Electricity' : `Tariff ${series.length + 1}`);
+          const color = SERIES_COLORS[colorIdx++ % SERIES_COLORS.length];
+
+          if (flow.stat_cost) {
+            // Pre-recorded cost statistic
+            series.push({ key: flow.stat_cost, mode: 'stat', statId: flow.stat_cost, label, color });
+          } else if (flow.stat_energy_from && flow.number_energy_price != null) {
+            // Fixed unit rate: cost = energy_kWh × price
+            series.push({ key: flow.stat_energy_from, mode: 'fixed', energyStatId: flow.stat_energy_from, price: flow.number_energy_price, label, color });
+          } else if (flow.stat_energy_from && flow.entity_energy_price) {
+            // Dynamic rate (e.g. Octopus): cost = energy_kWh × mean_rate_per_period
+            series.push({ key: flow.stat_energy_from, mode: 'dynamic', energyStatId: flow.stat_energy_from, priceStatId: flow.entity_energy_price, label, color });
+          }
         }
       }
       return series;
     }
 
     async _fetchStats() {
-      if (!this._prefs || this._costSeries.length === 0) {
-        console.debug('[energy-cost-graph-card] skipping fetch — no prefs or cost series');
-        return;
-      }
+      if (!this._prefs || this._costSeries.length === 0) return;
 
-      const statIds = this._costSeries.map(s => s.id);
-      console.debug('[energy-cost-graph-card] fetching stats', {
-        statIds, start: this._start, end: this._end, period: this._chartPeriod,
-      });
+      const base = {
+        type:       'recorder/statistics_during_period',
+        start_time: this._start.toISOString(),
+        end_time:   this._end.toISOString(),
+        period:     this._chartPeriod,
+      };
+
+      const statSeries    = this._costSeries.filter(s => s.mode === 'stat');
+      const energySeries  = this._costSeries.filter(s => s.mode !== 'stat');
+      const dynamicSeries = this._costSeries.filter(s => s.mode === 'dynamic');
+
       try {
-        // recorder/statistics_during_period (added HA 2021.12, types param ≥ 2022.12)
-        this._stats = await this._hass.callWS({
-          type: 'recorder/statistics_during_period',
-          start_time: this._start.toISOString(),
-          end_time:   this._end.toISOString(),
-          statistic_ids: statIds,
-          period: this._chartPeriod,
-          types: ['change', 'sum'],
-          units: {},
-        });
-        console.debug('[energy-cost-graph-card] stats response', this._stats);
+        const [costData, energyData, priceData] = await Promise.all([
+          statSeries.length
+            ? this._hass.callWS({ ...base, statistic_ids: statSeries.map(s => s.statId), types: ['change', 'sum'], units: {} })
+            : {},
+          energySeries.length
+            ? this._hass.callWS({ ...base, statistic_ids: [...new Set(energySeries.map(s => s.energyStatId))], types: ['change', 'sum'], units: { energy: 'kWh' } })
+            : {},
+          dynamicSeries.length
+            ? this._hass.callWS({ ...base, statistic_ids: [...new Set(dynamicSeries.map(s => s.priceStatId))], types: ['mean'], units: {} })
+            : {},
+        ]);
+        this._costData   = costData;
+        this._energyData = energyData;
+        this._priceData  = priceData;
       } catch (err) {
         console.error('[energy-cost-graph-card] stats fetch failed', err);
-        this._stats = {};
+        this._costData = this._energyData = this._priceData = {};
         throw err;
       }
     }
@@ -505,34 +513,14 @@
     // -------------------------------------------------------------------------
 
     _buildChartData() {
-      if (!this._costSeries.length || !this._stats) return [];
+      if (!this._costSeries.length) return [];
 
-      // Collect all timestamps that appear in any series
-      const slotMap = new Map(); // ts(ms) → {ts, values:{seriesId→value}}
+      const slotMap = new Map();
 
       for (const series of this._costSeries) {
-        const rows = this._stats[series.id];
-        if (!rows?.length) continue;
-
-        // HA may return 'change' directly; fall back to computing delta from 'sum'.
-        let prevSum = null;
-
-        for (const row of rows) {
-          // Timestamps may be ms or seconds – normalise
-          const ts = row.start > 1e12 ? row.start : row.start * 1000;
-
-          let value = row.change;
-          if (value == null) {
-            // Older HA or types not supported: derive from consecutive sums
-            value = (row.sum != null && prevSum != null) ? row.sum - prevSum : 0;
-          }
-          prevSum = row.sum ?? prevSum;
-
-          // Cost deltas should never be negative in a bar chart
-          value = Math.max(0, value || 0);
-
+        for (const { ts, value } of this._computeCostValues(series)) {
           if (!slotMap.has(ts)) slotMap.set(ts, { ts, values: {} });
-          slotMap.get(ts).values[series.id] = value;
+          slotMap.get(ts).values[series.key] = Math.max(0, value || 0);
         }
       }
 
@@ -541,8 +529,38 @@
         .map(slot => ({
           ...slot,
           label: this._timeLabel(new Date(slot.ts)),
-          total: this._costSeries.reduce((s, sr) => s + (slot.values[sr.id] || 0), 0),
+          total: this._costSeries.reduce((s, sr) => s + (slot.values[sr.key] || 0), 0),
         }));
+    }
+
+    _computeCostValues(series) {
+      if (series.mode === 'stat') {
+        return this._deltaRows(this._costData?.[series.statId] || []);
+      }
+      const energyDeltas = this._deltaRows(this._energyData?.[series.energyStatId] || []);
+      if (series.mode === 'fixed') {
+        return energyDeltas.map(({ ts, value }) => ({ ts, value: value * series.price }));
+      }
+      // dynamic: energy × mean rate recorded per period
+      const priceLookup = new Map(
+        (this._priceData?.[series.priceStatId] || []).map(r => {
+          const ts = r.start > 1e12 ? r.start : r.start * 1000;
+          return [ts, r.mean ?? 0];
+        })
+      );
+      return energyDeltas.map(({ ts, value }) => ({ ts, value: value * (priceLookup.get(ts) ?? 0) }));
+    }
+
+    _deltaRows(rows) {
+      const result = [];
+      let prevSum = null;
+      for (const row of rows) {
+        const ts = row.start > 1e12 ? row.start : row.start * 1000;
+        const value = row.change ?? ((row.sum != null && prevSum != null) ? row.sum - prevSum : 0);
+        prevSum = row.sum ?? prevSum;
+        result.push({ ts, value });
+      }
+      return result;
     }
 
     _timeLabel(date) {
@@ -768,7 +786,7 @@
         const x0 = i * slotW + barPad;
         let stackTop = ch; // pixels from top within chart area, starts at bottom
         const rects = this._costSeries.map(series => {
-          const v = slot.values[series.id] || 0;
+          const v = slot.values[series.key] || 0;
           if (v <= 0) return '';
           const bh = (v / yMax) * ch;
           stackTop -= bh;
