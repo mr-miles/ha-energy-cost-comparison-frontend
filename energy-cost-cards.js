@@ -436,6 +436,26 @@
         this._costSeries = this._extractCostSeries(this._prefs);
         console.debug('[energy-cost-graph-card] prefs', this._prefs);
         console.debug('[energy-cost-graph-card] cost series', this._costSeries);
+
+        // List all available statistics so we can see what the recorder actually has
+        try {
+          const allStats = await this._hass.callWS({ type: 'recorder/list_statistic_ids', statistic_type: 'sum' });
+          const energyIds = new Set([
+            ...this._costSeries.map(s => s.statId).filter(Boolean),
+            ...this._costSeries.map(s => s.energyStatId).filter(Boolean),
+          ]);
+          const relevant = allStats.filter(s => energyIds.has(s.statistic_id));
+          console.debug('[energy-cost-graph-card] relevant recorder stats (sum)', relevant);
+          console.debug('[energy-cost-graph-card] all recorder stats (sum)', allStats.map(s => s.statistic_id));
+        } catch (_) {}
+
+        try {
+          const meanStats = await this._hass.callWS({ type: 'recorder/list_statistic_ids', statistic_type: 'mean' });
+          const priceIds = new Set(this._costSeries.map(s => s.priceStatId).filter(Boolean));
+          const relevant = meanStats.filter(s => priceIds.has(s.statistic_id));
+          console.debug('[energy-cost-graph-card] relevant recorder stats (mean/price)', relevant);
+        } catch (_) {}
+
       } catch (_) {
         // Energy component might not be installed / configured
         this._prefs = null;
