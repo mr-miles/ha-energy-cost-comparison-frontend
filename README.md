@@ -38,18 +38,17 @@ weeks: 5                 # weeks of history to average, 1–12  (default: 5)
 
 ## Installation
 
-### Graph card — via HACS
+### Via HACS
 
-1. HACS → Frontend → ⋮ → **Custom repositories**
-2. URL: `https://github.com/mr-miles/ha-energy-cost-comparison-frontend` · Category: **Dashboard**
-3. Install **Energy Cost Graph Card** — HACS registers the resource automatically
+1. HACS → ⋮ → **Custom repositories**
+2. URL: `https://github.com/mr-miles/ha-energy-cost-comparison-frontend` · Category: **Dashboard** → Add
+3. Find **Energy Cost Cards** → **Download**
 
-### Compare card — manual
+HACS installs `energy-cost-cards.js`, which registers both cards in one resource.
 
-HACS only installs one file per repository entry. To install the compare card:
+### Manually
 
-1. Download `energy-cost-compare-card.js` from the [latest release](https://github.com/mr-miles/ha-energy-cost-comparison-frontend/releases/latest)
+1. Download `energy-cost-cards.js` from the [latest release](https://github.com/mr-miles/ha-energy-cost-comparison-frontend/releases/latest)
 2. Copy it to `/config/www/`
-3. Add a Lovelace resource: **Settings → Dashboards → ⋮ → Resources → Add resource**
-   - URL: `/local/energy-cost-compare-card.js`
-   - Type: JavaScript module
+3. **Settings → Dashboards → ⋮ → Resources → Add resource**
+   - URL: `/local/energy-cost-cards.js` · Type: JavaScript module

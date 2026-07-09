@@ -1,6 +1,6 @@
 {
-  "name": "Energy Cost Graph Card",
+  "name": "Energy Cost Cards",
   "render_readme": true,
-  "filename": "energy-cost-graph-card.js",
+  "filename": "energy-cost-cards.js",
   "content_in_root": true
 }
