@@ -419,7 +419,6 @@
     }
 
     async _loadAndRender() {
-      if (this._collectionActive) return; // driven by collection subscription
       this._loading = true;
       this._render();
       try {
@@ -486,6 +485,15 @@
       const energySeries  = this._costSeries.filter(s => s.mode !== 'stat');
       const dynamicSeries = this._costSeries.filter(s => s.mode === 'dynamic');
 
+      console.debug('[energy-cost-graph-card] fetching stats', {
+        period: this._chartPeriod,
+        start: this._start?.toISOString(),
+        end: this._end?.toISOString(),
+        statSeries: statSeries.map(s => s.statId),
+        energySeries: energySeries.map(s => s.energyStatId),
+        priceSeries: dynamicSeries.map(s => s.priceStatId),
+      });
+
       try {
         const [costData, energyData, priceData] = await Promise.all([
           statSeries.length
@@ -498,6 +506,9 @@
             ? this._hass.callWS({ ...base, statistic_ids: [...new Set(dynamicSeries.map(s => s.priceStatId))], types: ['mean'], units: {} })
             : {},
         ]);
+        console.debug('[energy-cost-graph-card] costData', costData);
+        console.debug('[energy-cost-graph-card] energyData', energyData);
+        console.debug('[energy-cost-graph-card] priceData', priceData);
         this._costData   = costData;
         this._energyData = energyData;
         this._priceData  = priceData;
@@ -883,10 +894,10 @@
           const slot  = data[idx];
           if (slot) {
             rows = this._costSeries
-              .filter(s => (slot.values[s.id] || 0) > 0)
+              .filter(s => (slot.values[s.key] || 0) > 0)
               .map(s => `<div class="tooltip-row">
                 <div class="tooltip-dot" style="background:${s.color}"></div>
-                <span>${s.label}: ${this._formatCost(slot.values[s.id] || 0)}</span>
+                <span>${s.label}: ${this._formatCost(slot.values[s.key] || 0)}</span>
               </div>`)
               .join('');
             if (this._costSeries.length > 1) {
