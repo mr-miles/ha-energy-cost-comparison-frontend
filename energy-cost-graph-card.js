@@ -439,6 +439,8 @@
       try {
         this._prefs = await this._hass.callWS({ type: 'energy/get_prefs' });
         this._costSeries = this._extractCostSeries(this._prefs);
+        console.debug('[energy-cost-graph-card] prefs', this._prefs);
+        console.debug('[energy-cost-graph-card] cost series', this._costSeries);
       } catch (_) {
         // Energy component might not be installed / configured
         this._prefs = null;
@@ -470,9 +472,15 @@
     }
 
     async _fetchStats() {
-      if (!this._prefs || this._costSeries.length === 0) return;
+      if (!this._prefs || this._costSeries.length === 0) {
+        console.debug('[energy-cost-graph-card] skipping fetch — no prefs or cost series');
+        return;
+      }
 
       const statIds = this._costSeries.map(s => s.id);
+      console.debug('[energy-cost-graph-card] fetching stats', {
+        statIds, start: this._start, end: this._end, period: this._chartPeriod,
+      });
       try {
         // recorder/statistics_during_period (added HA 2021.12, types param ≥ 2022.12)
         this._stats = await this._hass.callWS({
@@ -484,6 +492,7 @@
           types: ['change', 'sum'],
           units: {},
         });
+        console.debug('[energy-cost-graph-card] stats response', this._stats);
       } catch (err) {
         console.error('[energy-cost-graph-card] stats fetch failed', err);
         this._stats = {};
