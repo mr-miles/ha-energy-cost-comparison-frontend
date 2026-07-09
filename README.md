@@ -41,7 +41,7 @@ weeks: 5                 # weeks of history to average, 1–12  (default: 5)
 ### Graph card — via HACS
 
 1. HACS → Frontend → ⋮ → **Custom repositories**
-2. URL: `https://github.com/mr-miles/ha-energy-cost-comparison-frontend` · Category: **Lovelace**
+2. URL: `https://github.com/mr-miles/ha-energy-cost-comparison-frontend` · Category: **Dashboard**
 3. Install **Energy Cost Graph Card** — HACS registers the resource automatically
 
 ### Compare card — manual
