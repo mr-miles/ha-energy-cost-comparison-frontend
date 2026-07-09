@@ -470,20 +470,26 @@
       let colorIdx = 0;
       for (const source of prefs.energy_sources) {
         if (source.type !== 'grid') continue;
-        for (const flow of source.flow_from || []) {
+
+        // HA nests per-tariff data in flow_from[]. Some versions/configs may
+        // place the fields directly on the source object instead.
+        const flows = Array.isArray(source.flow_from) && source.flow_from.length
+          ? source.flow_from
+          : [source];
+
+        console.debug('[energy-cost-graph-card] grid source flows', flows);
+
+        for (const flow of flows) {
           const entityId = flow.stat_energy_from;
           const friendlyName = entityId && this._hass?.states?.[entityId]?.attributes?.friendly_name;
           const label = friendlyName || (series.length === 0 ? 'Electricity' : `Tariff ${series.length + 1}`);
           const color = SERIES_COLORS[colorIdx++ % SERIES_COLORS.length];
 
           if (flow.stat_cost) {
-            // Pre-recorded cost statistic
             series.push({ key: flow.stat_cost, mode: 'stat', statId: flow.stat_cost, label, color });
           } else if (flow.stat_energy_from && flow.number_energy_price != null) {
-            // Fixed unit rate: cost = energy_kWh × price
             series.push({ key: flow.stat_energy_from, mode: 'fixed', energyStatId: flow.stat_energy_from, price: flow.number_energy_price, label, color });
           } else if (flow.stat_energy_from && flow.entity_energy_price) {
-            // Dynamic rate (e.g. Octopus): cost = energy_kWh × mean_rate_per_period
             series.push({ key: flow.stat_energy_from, mode: 'dynamic', energyStatId: flow.stat_energy_from, priceStatId: flow.entity_energy_price, label, color });
           }
         }
@@ -1095,7 +1101,12 @@
     if (!prefs?.energy_sources) return sources;
     for (const source of prefs.energy_sources) {
       if (source.type !== 'grid') continue;
-      for (const flow of source.flow_from || []) {
+      // HA nests per-tariff data in flow_from[]. Some versions/configs may
+      // place the fields directly on the source object instead.
+      const flows = Array.isArray(source.flow_from) && source.flow_from.length
+        ? source.flow_from
+        : [source];
+      for (const flow of flows) {
         if (flow.stat_cost) {
           sources.push({ mode: 'stat', statId: flow.stat_cost });
         } else if (flow.stat_energy_from && flow.number_energy_price != null) {

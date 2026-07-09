@@ -123,7 +123,12 @@
     if (!prefs?.energy_sources) return sources;
     for (const source of prefs.energy_sources) {
       if (source.type !== 'grid') continue;
-      for (const flow of source.flow_from || []) {
+      // HA nests per-tariff data in flow_from[]. Some versions/configs may
+      // place the fields directly on the source object instead.
+      const flows = Array.isArray(source.flow_from) && source.flow_from.length
+        ? source.flow_from
+        : [source];
+      for (const flow of flows) {
         if (flow.stat_cost) {
           sources.push({ mode: 'stat', statId: flow.stat_cost });
         } else if (flow.stat_energy_from && flow.number_energy_price != null) {

@@ -28,7 +28,10 @@ function extractCostSeries(prefs, hassStates = {}) {
   let colorIdx = 0;
   for (const source of prefs.energy_sources) {
     if (source.type !== 'grid') continue;
-    for (const flow of source.flow_from || []) {
+    const flows = Array.isArray(source.flow_from) && source.flow_from.length
+      ? source.flow_from
+      : [source];
+    for (const flow of flows) {
       const entityId = flow.stat_energy_from;
       const friendlyName = entityId && hassStates?.[entityId]?.attributes?.friendly_name;
       const label = friendlyName || (series.length === 0 ? 'Electricity' : `Tariff ${series.length + 1}`);
@@ -91,7 +94,10 @@ function extractCostSources(prefs) {
   if (!prefs?.energy_sources) return sources;
   for (const source of prefs.energy_sources) {
     if (source.type !== 'grid') continue;
-    for (const flow of source.flow_from || []) {
+    const flows = Array.isArray(source.flow_from) && source.flow_from.length
+      ? source.flow_from
+      : [source];
+    for (const flow of flows) {
       if (flow.stat_cost) {
         sources.push({ mode: 'stat', statId: flow.stat_cost });
       } else if (flow.stat_energy_from && flow.number_energy_price != null) {

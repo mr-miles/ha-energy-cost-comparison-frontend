@@ -107,6 +107,26 @@ describe('extractCostSeries', () => {
     assert.deepEqual(extractCostSeries(null), []);
   });
 
+  it('handles flat source structure (fields directly on source, no flow_from array)', () => {
+    // Some HA versions / configs place the fields directly on the source object
+    // rather than inside a nested flow_from array. This was the root cause of
+    // _costSeries being empty for Octopus Energy users.
+    const prefs = {
+      energy_sources: [{
+        type: 'grid',
+        stat_cost: null,
+        stat_energy_from: ENERGY_ID,
+        number_energy_price: null,
+        entity_energy_price: PRICE_ID,
+      }],
+    };
+    const series = extractCostSeries(prefs);
+    assert.equal(series.length, 1);
+    assert.equal(series[0].mode, 'dynamic');
+    assert.equal(series[0].energyStatId, ENERGY_ID);
+    assert.equal(series[0].priceStatId, PRICE_ID);
+  });
+
   it('skips flow with no cost info', () => {
     const prefs = {
       energy_sources: [{
@@ -218,6 +238,21 @@ describe('computeCostValues — dynamic mode', () => {
 // ── extractCostSources (compare card) ────────────────────────────────────────
 
 describe('extractCostSources', () => {
+  it('handles flat source structure (no flow_from nesting)', () => {
+    const prefs = {
+      energy_sources: [{
+        type: 'grid',
+        stat_cost: null,
+        stat_energy_from: ENERGY_ID,
+        number_energy_price: null,
+        entity_energy_price: PRICE_ID,
+      }],
+    };
+    const [s] = extractCostSources(prefs);
+    assert.equal(s.mode, 'dynamic');
+    assert.equal(s.energyStatId, ENERGY_ID);
+  });
+
   it('returns dynamic source for Octopus prefs', () => {
     const sources = extractCostSources(OCTOPUS_PREFS);
     assert.equal(sources.length, 1);
